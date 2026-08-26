@@ -1,5 +1,6 @@
 use std::{
     env,
+    fmt::Write as FmtWrite,
     io::{self, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
@@ -8,26 +9,26 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use crossterm::{cursor, execute, terminal, terminal::ClearType};
+use crossterm::{cursor, execute, terminal};
 
 const FPS: u64 = 30;
-const PIXELS: &[u8] = b" .:-=+*#%@";
 const WORDS_PATH: &str = "text/text.txt";
+const CELL_WIDTH: usize = 4;
 
 fn main() -> Result<()> {
     let video_path = env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("video/Bad Apple.mp4"));
+        .unwrap_or_else(|| PathBuf::from("video/video.mp4"));
 
     if !video_path.exists() {
         bail!("видео не найдено: {}", video_path.display());
     }
     let words = load_words()?;
 
+    let (source_width, source_height) = video_size(&video_path)?;
     let (columns, rows) = terminal::size().context("не удалось определить размер консоли")?;
-    let width = columns.max(1) as usize / 2;
-    let height = rows.saturating_sub(1).max(1) as usize;
+    let (width, height) = fit_video(source_width, source_height, columns as usize, rows as usize);
     let frame_size = width * height;
 
     let mut ffmpeg = Command::new("ffmpeg")
@@ -77,7 +78,6 @@ fn play(
 ) -> Result<()> {
     let mut frame = vec![0; frame_size];
     let frame_delay = Duration::from_millis(1000 / FPS);
-    let mut frame_number = 0usize;
 
     loop {
         let mut received = 0;
@@ -89,16 +89,57 @@ fn play(
             received += count;
         }
 
-        execute!(stdout, cursor::MoveTo(0, 0))?;
-        for row in frame.chunks_exact(width).take(height) {
-            execute!(stdout, terminal::Clear(ClearType::CurrentLine))?;
-            write_row(stdout, row, words, frame_number)?;
-            writeln!(stdout)?;
+        let (terminal_width, terminal_height) = terminal::size()
+            .map(|size| (size.0 as usize, size.1 as usize))
+            .unwrap_or((width * CELL_WIDTH, height + 1));
+        let frame_width = width * CELL_WIDTH;
+        let left = terminal_width.saturating_sub(frame_width) / 2;
+        let top = terminal_height.saturating_sub(height) / 2;
+        let mut output = String::new();
+        for (row_number, row) in frame.chunks_exact(width).take(height).enumerate() {
+            // Position every row explicitly. Newline would reset the cursor
+            // to column one and break centering for narrow videos.
+            output.push_str(&format!("\x1b[{};{}H\x1b[2K", top + row_number + 1, left + 1));
+            write_row(&mut output, row, words, row_number)?;
         }
+        output.push_str("\x1b[0m");
+        write!(stdout, "{output}")?;
         stdout.flush()?;
         std::thread::sleep(frame_delay);
-        frame_number += 1;
     }
+}
+
+fn video_size(video_path: &PathBuf) -> Result<(usize, usize)> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=width,height", "-of", "csv=s=x:p=0",
+            video_path.to_str().context("некорректный путь к видео")?,
+        ])
+        .output()
+        .context("не найден ffprobe. Он устанавливается вместе с FFmpeg")?;
+
+    let dimensions = String::from_utf8_lossy(&output.stdout);
+    let (width, height) = dimensions
+        .trim()
+        .split_once('x')
+        .context("ffprobe не вернул размеры видео")?;
+    Ok((width.parse()?, height.parse()?))
+}
+
+fn fit_video(source_width: usize, source_height: usize, columns: usize, rows: usize) -> (usize, usize) {
+    // One logical video pixel occupies two console columns, so compensate for
+    // the terminal character cell being taller than it is wide.
+    let available_width = columns / CELL_WIDTH;
+    let available_height = rows.saturating_sub(1);
+    let scale = (available_width as f64 / source_width as f64)
+        .min(available_height as f64 / source_height as f64)
+        .max(0.01);
+
+    (
+        ((source_width as f64 * scale).floor() as usize).max(1),
+        ((source_height as f64 * scale).floor() as usize).max(1),
+    )
 }
 
 fn load_words() -> Result<Vec<String>> {
@@ -118,47 +159,43 @@ fn load_words() -> Result<Vec<String>> {
 }
 
 fn write_row(
-    stdout: &mut io::Stdout,
+    output: &mut String,
     row: &[u8],
     words: &[String],
-    frame_number: usize,
+    row_number: usize,
 ) -> Result<()> {
     let mut position = 0;
     let mut previous_was_word = false;
     while position < row.len() {
-        let brightness = row[position];
-        let index = brightness as usize * (PIXELS.len() - 1) / 255;
-        let symbol = PIXELS[index] as char;
+        let brightness = row[position] as usize;
+        let render_word = brightness > 12
+            && brightness > BAYER_4X4[row_number % 4][position % 4] as usize;
 
-        if (symbol == '%' || symbol == '@') && position + 1 < row.len() {
-            let mut run_length = 1;
-            while run_length < 3 && position + run_length < row.len() {
-                let next_index = row[position + run_length] as usize * (PIXELS.len() - 1) / 255;
-                let next_symbol = PIXELS[next_index] as char;
-                if next_symbol != symbol {
-                    break;
-                }
-                run_length += 1;
-            }
-
-            if run_length == 2 || run_length == 3 {
-                let candidates = words.iter().filter(|word| word.len() == run_length).collect::<Vec<_>>();
-                if !candidates.is_empty() {
-                    let word = candidates[(frame_number + position) % candidates.len()];
-                    if previous_was_word {
-                        write!(stdout, "+")?;
-                    }
-                    write!(stdout, "{word}")?;
-                    previous_was_word = true;
-                    position += run_length;
-                    continue;
-                }
-            }
+        if render_word {
+            let word_index = brightness * words.len() / 256;
+            let word = &words[word_index.min(words.len() - 1)];
+            write_word(output, word, previous_was_word)?;
+        } else {
+            output.push_str("    ");
         }
-
-        write!(stdout, "{symbol}{symbol}")?;
-        previous_was_word = false;
+        previous_was_word = render_word;
         position += 1;
     }
+    Ok(())
+}
+
+const BAYER_4X4: [[u8; 4]; 4] = [
+    [8, 136, 40, 168],
+    [200, 72, 232, 104],
+    [56, 184, 24, 152],
+    [248, 120, 216, 88],
+];
+
+fn write_word(output: &mut String, word: &str, separator: bool) -> Result<()> {
+    // A fixed-width cell preserves the image proportions while + separates
+    // adjacent words without adding columns to the frame.
+    output.push(if separator { '+' } else { ' ' });
+    write!(output, "{word}")?;
+    output.push_str(&" ".repeat(CELL_WIDTH - 1 - word.len()));
     Ok(())
 }
